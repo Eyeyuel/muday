@@ -1,4 +1,4 @@
-# 🌾 Muday (ሙዳይ)
+#  Muday (ሙዳይ)
 
 > **Voice-First Telegram Expense Tracker for Ethiopia — Powered by AddisAI STT & Google Gemini**
 
