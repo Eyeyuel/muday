@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.local/
+package-lock.json
+*.pdf
+apps/backend/src/generated/
+apps/mobile/
+mezgeb-developer-guide.md
+mezgeb-upgraded-development-plan.md
+telegram-expense-bot-mvp-spec.md

@@ -1,0 +1,226 @@
+name: Deploy Muday App to Contabo VPS
+
+on:
+  # Manual trigger only — no automatic deploys on push
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'Commit Hash, Branch, or Tag to deploy'
+        required: true
+        default: 'main'
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Server via SSH
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git_ref || github.ref_name }}
+
+      - name: Deploy to Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          PROD_ENV: ${{ secrets.PROD_ENV_FILE }}
+          STAGE_ENV: ${{ secrets.STAGE_ENV_FILE }}
+          TARGET_ENV: ${{ github.event.inputs.environment || (github.ref_name == 'staging' && 'staging' || 'production') }}
+          DEPLOY_REF: ${{ github.event.inputs.git_ref || github.ref_name }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 30m
+          envs: PROD_ENV,STAGE_ENV,TARGET_ENV,DEPLOY_REF
+          script: |
+            set -Eeuo pipefail
+
+            echo "=== 🚀 Starting Muday Deployment [$TARGET_ENV] ref=[$DEPLOY_REF] ==="
+
+            # ─── 1. Environment configuration ─────────────────────────────────
+            if [ "$TARGET_ENV" = "production" ]; then
+              DEPLOY_DIR="/var/www/muday"
+              PROJECT_NAME="muday-production"
+              CONTAINER_PREFIX="muday"
+              IMAGE_TAG="production"
+              NETWORK_NAME="muday-network"
+              POSTGRES_VOLUME_NAME="muday-production-postgres-data"
+              REDIS_VOLUME_NAME="muday-production-redis-data"
+              ENV_CONTENT="$PROD_ENV"
+              HEALTH_PORT="6030"
+            else
+              DEPLOY_DIR="/var/www/muday-staging"
+              PROJECT_NAME="muday-staging"
+              CONTAINER_PREFIX="muday-staging"
+              IMAGE_TAG="staging"
+              NETWORK_NAME="muday-staging-network"
+              POSTGRES_VOLUME_NAME="muday-staging-postgres-data"
+              REDIS_VOLUME_NAME="muday-staging-redis-data"
+              ENV_CONTENT="$STAGE_ENV"
+              HEALTH_PORT="6031"
+            fi
+
+            echo "    Deployment Directory : $DEPLOY_DIR"
+            echo "    Docker Project Name  : $PROJECT_NAME"
+            echo "    Container Prefix     : $CONTAINER_PREFIX"
+
+            # ─── 2. Auto-provision on first deploy ────────────────────────────
+            if [ ! -d "$DEPLOY_DIR" ]; then
+              echo "Directory not found — initializing $DEPLOY_DIR and cloning repository via SSH..."
+              mkdir -p "$DEPLOY_DIR"
+              git clone git@github.com:${{ github.repository }}.git "$DEPLOY_DIR" || git clone https://github.com/${{ github.repository }}.git "$DEPLOY_DIR"
+            fi
+
+            cd "$DEPLOY_DIR"
+
+            # ─── 3. Smart Incremental .env Merge Engine ───────────────────────
+            # Reads PROD_ENV_FILE / STAGE_ENV_FILE secret and merges KEY=VALUE into the server .env:
+            #   Existing key, same value   → untouched (no change)
+            #   Existing key, new value    → updated in-place
+            #   New key not in file        → appended at bottom
+            #   Keys only on the server    → preserved 100% as-is
+            #
+            # This allows teammates to update 1-2 keys in GitHub Secrets without
+            # re-entering the entire 60+ line .env file.
+
+            ENV_FILE="$DEPLOY_DIR/.env"
+            if [ ! -f "$ENV_FILE" ]; then
+              touch "$ENV_FILE" || true
+            fi
+            chmod u+rw "$ENV_FILE" 2>/dev/null || true
+
+            if [ -n "$ENV_CONTENT" ]; then
+              echo "🔄 Smart merging $TARGET_ENV .env with GitHub Secrets..."
+              ENV_CONTENT="$ENV_CONTENT" node -e '
+                const fs = require("fs");
+                const path = process.argv[1];
+                const incoming = process.env.ENV_CONTENT || "";
+
+                let lines = [];
+                if (fs.existsSync(path)) {
+                  try {
+                    lines = fs.readFileSync(path, "utf8").split(/\r?\n/);
+                  } catch (e) {
+                    console.error("Warning: Could not read existing .env: " + e.message);
+                  }
+                }
+
+                const incomingEntries = incoming.split(/\r?\n/)
+                  .map(line => line.trim())
+                  .filter(line => line && !line.startsWith("#") && line.includes("="));
+
+                const incomingMap = new Map();
+                for (const entry of incomingEntries) {
+                  const idx = entry.indexOf("=");
+                  const key = entry.slice(0, idx).trim();
+                  const val = entry.slice(idx + 1);
+                  if (key) incomingMap.set(key, val);
+                }
+
+                const updatedKeys = new Set();
+                const newLines = lines.map(line => {
+                  const trimmed = line.trim();
+                  if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) {
+                    return line;
+                  }
+                  const idx = trimmed.indexOf("=");
+                  const key = trimmed.slice(0, idx).trim();
+                  if (incomingMap.has(key)) {
+                    updatedKeys.add(key);
+                    return `${key}=${incomingMap.get(key)}`;
+                  }
+                  return line;
+                });
+
+                for (const [key, val] of incomingMap.entries()) {
+                  if (!updatedKeys.has(key)) {
+                    newLines.push(`${key}=${val}`);
+                  }
+                }
+
+                try {
+                  fs.writeFileSync(path, newLines.join("\n").trim() + "\n", { mode: 0o644 });
+                  console.log("Successfully merged " + incomingMap.size + " environment variable(s) into " + path);
+                } catch (err) {
+                  console.error("Error writing to " + path + ": " + err.message);
+                  process.exit(1);
+                }
+              ' "$ENV_FILE"
+            else
+              echo "ℹ️  No GitHub ENV secret passed — using existing server .env file."
+            fi
+
+            # ─── 4. Pull latest source code ───────────────────────────────────
+            echo "📥 Fetching latest code for ref: $DEPLOY_REF..."
+            mkdir -p ~/.ssh
+            export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new"
+            ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+            git config --global --add safe.directory "$DEPLOY_DIR" 2>/dev/null || true
+            git remote set-url origin git@github.com:${{ github.repository }}.git
+            git fetch origin "$DEPLOY_REF" || git fetch origin
+            git reset --hard "origin/$DEPLOY_REF" || git reset --hard "$DEPLOY_REF"
+            DEPLOYED_SHA="$(git rev-parse HEAD)"
+            echo "Server repository SHA: $DEPLOYED_SHA"
+
+            # ─── 5. Rebuild and restart services ──────────────────────────────
+            echo "🐳 Building and starting services with project name: $PROJECT_NAME (tag: $IMAGE_TAG)..."
+            export CONTAINER_PREFIX="$CONTAINER_PREFIX"
+            export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+            export IMAGE_TAG="$IMAGE_TAG"
+            export NETWORK_NAME="$NETWORK_NAME"
+            export POSTGRES_VOLUME_NAME="$POSTGRES_VOLUME_NAME"
+            export REDIS_VOLUME_NAME="$REDIS_VOLUME_NAME"
+
+            # Clean up app containers from previous runs to prevent docker container name conflicts
+            docker rm -f "${CONTAINER_PREFIX}-landing-standalone" "${CONTAINER_PREFIX}-frontend-standalone" "${CONTAINER_PREFIX}-backend-standalone" "${CONTAINER_PREFIX}-worker-standalone" "${CONTAINER_PREFIX}-telegram-sync-standalone" "${CONTAINER_PREFIX}-migrate-standalone" 2>/dev/null || true
+
+            # Ensure network exists and databases are attached with service aliases
+            docker network create "$NETWORK_NAME" 2>/dev/null || true
+            docker network connect --alias postgres "$NETWORK_NAME" "${CONTAINER_PREFIX}-postgres-standalone" 2>/dev/null || true
+            docker network connect --alias redis "$NETWORK_NAME" "${CONTAINER_PREFIX}-redis-standalone" 2>/dev/null || true
+
+            docker compose -p "$PROJECT_NAME" -f docker-compose.production.yml up --build -d --remove-orphans
+
+            # ─── 6. Verify Service Health ─────────────────────────────────────
+            echo "🩺 Verifying API readiness on port $HEALTH_PORT..."
+            HEALTH_STATUS=""
+            for attempt in $(seq 1 30); do
+              if curl -s -f "http://127.0.0.1:$HEALTH_PORT/health/ready" | grep -q '"status":"ok"'; then
+                HEALTH_STATUS="ok"
+                break
+              fi
+              echo "  Attempt $attempt/30 — waiting for API health on port $HEALTH_PORT..."
+              sleep 4
+            done
+
+            if [ "$HEALTH_STATUS" != "ok" ]; then
+              echo "❌ Health check timed out on port $HEALTH_PORT." >&2
+              docker compose -p "$PROJECT_NAME" -f docker-compose.production.yml logs --tail=100
+              exit 1
+            fi
+            echo "✅ API is healthy and ready!"
+
+            # ─── 7. Prune dangling Docker images ──────────────────────────────
+            echo "🧹 Pruning unused Docker images..."
+            docker image prune -f
+
+            echo ""
+            echo "🎉 Deployment complete — env=[$TARGET_ENV] sha=[$DEPLOYED_SHA]"

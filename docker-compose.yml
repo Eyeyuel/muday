@@ -1,0 +1,211 @@
+name: muday-local
+
+x-muday-backend: &muday-backend
+  image: muday/backend:local
+  env_file: .env
+  restart: unless-stopped
+  environment:
+    NODE_ENV: development
+    NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+    HOST: 0.0.0.0
+    DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:-muday_local_password}@muday-postgres:5432/${POSTGRES_DB:-muday}?schema=public
+    REDIS_URL: redis://muday-redis:6379
+    PUBLIC_API_URL: http://localhost:3001
+    MINIAPP_URL: http://localhost:8080
+    VOICE_TEMP_DIR: /app/.local/tmp/voice
+    RECEIPT_TEMP_DIR: /app/.local/tmp/receipt
+    ALLOW_LOCAL_DEV_AUTH: 'true'
+  depends_on:
+    muday-postgres:
+      condition: service_healthy
+    muday-redis:
+      condition: service_healthy
+  volumes:
+    - ./.local/media:/app/.local/media
+  tmpfs:
+    - /tmp
+    # A tmpfs mount replaces the image-owned directory at runtime, so assign the
+    # mount to the non-root `muday` user (UID 100/GID 101) explicitly.
+    - /app/.local/tmp/voice:uid=100,gid=101,mode=0700
+    - /app/.local/tmp/receipt:uid=100,gid=101,mode=0700
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  muday-postgres:
+    container_name: muday-local-postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-muday}
+      POSTGRES_USER: ${POSTGRES_USER:-muday}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-muday_local_password}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - muday_local_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  muday-redis:
+    container_name: muday-local-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - muday_local_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  muday-migrate:
+    <<: *muday-backend
+    container_name: muday-local-migrate
+    restart: 'no'
+    command: ['npm', 'run', 'db:migrate:deploy']
+
+  muday-api:
+    <<: *muday-backend
+    container_name: muday-local-api
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: api
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:-muday_local_password}@muday-postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://muday-redis:6379
+      PUBLIC_API_URL: http://localhost:3001
+      MINIAPP_URL: http://localhost:8080
+      VOICE_TEMP_DIR: /app/.local/tmp/voice
+      ALLOW_LOCAL_DEV_AUTH: 'true'
+    depends_on:
+      muday-migrate:
+        condition: service_completed_successfully
+    ports:
+      - '0.0.0.0:3001:3001'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3001/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  muday-worker:
+    <<: *muday-backend
+    container_name: muday-local-worker
+    command: ['node', 'apps/backend/dist/main-worker.js']
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: worker
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:-muday_local_password}@muday-postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://muday-redis:6379
+      PUBLIC_API_URL: http://localhost:3001
+      MINIAPP_URL: http://localhost:8080
+      VOICE_TEMP_DIR: /app/.local/tmp/voice
+      ALLOW_LOCAL_DEV_AUTH: 'true'
+    depends_on:
+      muday-migrate:
+        condition: service_completed_successfully
+
+  muday-bot:
+    <<: *muday-backend
+    container_name: muday-local-bot
+    command: ['node', 'apps/backend/dist/main-bot.js']
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: bot
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:-muday_local_password}@muday-postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://muday-redis:6379
+      PUBLIC_API_URL: http://localhost:3001
+      MINIAPP_URL: http://localhost:8080
+      VOICE_TEMP_DIR: /app/.local/tmp/voice
+      ALLOW_LOCAL_DEV_AUTH: 'true'
+    depends_on:
+      muday-migrate:
+        condition: service_completed_successfully
+
+  muday-miniapp:
+    container_name: muday-local-miniapp
+    image: muday/miniapp:local
+    build:
+      context: .
+      dockerfile: apps/miniapp/Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:3001
+        VITE_ALLOW_LOCAL_DEV_AUTH: 'true'
+    restart: unless-stopped
+    depends_on:
+      muday-api:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:8080:8080'
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+
+  muday-landing:
+    container_name: muday-local-landing
+    image: muday/landing:local
+    build:
+      context: .
+      dockerfile: apps/landing/Dockerfile
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:${MUDAY_LANDING_HOST_PORT:-5175}:8080'
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+
+  muday-test:
+    container_name: muday-local-test
+    image: muday/test:local
+    profiles: ['test']
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      NODE_ENV: test
+      APP_ROLE: api
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:-muday_local_password}@muday-postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://muday-redis:6379
+      TELEGRAM_BOT_TOKEN: ''
+      TELEGRAM_WEBHOOK_SECRET: docker_test_webhook_secret_value
+      STT_PROVIDER: fake
+      EXTRACTION_PROVIDER: fake
+      ALLOW_LOCAL_DEV_AUTH: 'false'
+    depends_on:
+      muday-migrate:
+        condition: service_completed_successfully
+
+volumes:
+  muday_local_postgres_data:
+    name: muday-local-postgres-data
+  muday_local_redis_data:
+    name: muday-local-redis-data

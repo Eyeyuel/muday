@@ -1,0 +1,176 @@
+name: ${COMPOSE_PROJECT_NAME:-muday-production}
+
+x-backend: &backend
+  image: muday/backend:${IMAGE_TAG:-production}
+  build:
+    context: .
+    dockerfile: apps/backend/Dockerfile
+  restart: unless-stopped
+  env_file: ${PRODUCTION_ENV_FILE:-.env}
+  environment:
+    NODE_ENV: production
+    NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+    DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-muday}?schema=public
+    REDIS_URL: redis://redis:6379
+    VOICE_TEMP_DIR: /app/.local/tmp/voice
+    RECEIPT_TEMP_DIR: /app/.local/tmp/receipt
+    ALLOW_LOCAL_DEV_AUTH: 'false'
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  read_only: true
+  tmpfs:
+    - /tmp
+    # Keep temporary user media writable only by the non-root runtime user.
+    - /app/.local/tmp/voice:uid=100,gid=101,mode=0700
+    - /app/.local/tmp/receipt:uid=100,gid=101,mode=0700
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - muday-network
+
+services:
+  postgres:
+    container_name: ${CONTAINER_PREFIX:-muday}-postgres-standalone
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-muday}
+      POSTGRES_USER: ${POSTGRES_USER:-muday}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks:
+      muday-network:
+        aliases:
+          - postgres
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    container_name: ${CONTAINER_PREFIX:-muday}-redis-standalone
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, 'yes']
+    volumes: [redis_data:/data]
+    networks:
+      muday-network:
+        aliases:
+          - redis
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    container_name: ${CONTAINER_PREFIX:-muday}-migrate-standalone
+    <<: *backend
+    restart: 'no'
+    command: [npm, run, db:migrate:deploy]
+
+  telegram-sync:
+    container_name: ${CONTAINER_PREFIX:-muday}-telegram-sync-standalone
+    <<: *backend
+    restart: 'no'
+    command: [node, apps/backend/dist/main-telegram-sync.js]
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: telegram-sync
+      MINIAPP_URL: ${MINIAPP_URL:?set MINIAPP_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+      ALLOW_LOCAL_DEV_AUTH: 'false'
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  api:
+    container_name: ${CONTAINER_PREFIX:-muday}-backend-standalone
+    <<: *backend
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: api
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://redis:6379
+      ALLOW_LOCAL_DEV_AUTH: 'false'
+    depends_on:
+      telegram-sync: { condition: service_completed_successfully }
+    ports: ['127.0.0.1:${MUDAY_API_HOST_PORT:-6030}:3001']
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:3001/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  worker:
+    container_name: ${CONTAINER_PREFIX:-muday}-worker-standalone
+    <<: *backend
+    command: [node, apps/backend/dist/main-worker.js]
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first --network-family-autoselection-attempt-timeout=1000
+      APP_ROLE: worker
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-muday}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-muday}?schema=public
+      REDIS_URL: redis://redis:6379
+      VOICE_TEMP_DIR: /app/.local/tmp/voice
+      RECEIPT_TEMP_DIR: /app/.local/tmp/receipt
+      ALLOW_LOCAL_DEV_AUTH: 'false'
+    depends_on:
+      telegram-sync: { condition: service_completed_successfully }
+
+  miniapp:
+    container_name: ${CONTAINER_PREFIX:-muday}-frontend-standalone
+    image: muday/miniapp:${IMAGE_TAG:-production}
+    build:
+      context: .
+      dockerfile: apps/miniapp/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${PUBLIC_API_URL:-http://mudayai.learnica.net/backend}
+        VITE_ALLOW_LOCAL_DEV_AUTH: 'false'
+    restart: unless-stopped
+    depends_on:
+      api: { condition: service_healthy }
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run]
+    security_opt: [no-new-privileges:true]
+    ports: ['127.0.0.1:${MUDAY_MINIAPP_HOST_PORT:-3030}:8080']
+    networks: [muday-network]
+
+  landing:
+    container_name: ${CONTAINER_PREFIX:-muday}-landing-standalone
+    image: muday/landing:${IMAGE_TAG:-production}
+    build:
+      context: .
+      dockerfile: apps/landing/Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run]
+    security_opt: [no-new-privileges:true]
+    ports: ['127.0.0.1:${MUDAY_LANDING_HOST_PORT:-5050}:8080']
+    networks: [muday-network]
+
+volumes:
+  postgres_data:
+    name: ${POSTGRES_VOLUME_NAME:-muday-production-postgres-data}
+  redis_data:
+    name: ${REDIS_VOLUME_NAME:-muday-production-redis-data}
+
+networks:
+  muday-network:
+    name: ${NETWORK_NAME:-muday-network}
+    driver: bridge

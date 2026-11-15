@@ -1,0 +1,137 @@
+@import url('https://api.fontshare.com/v2/css?f[]=general-sans@500,600,700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Inter:wght@300;400;500;600;700;800;900&family=Noto+Sans+Ethiopic:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* --- Centralized Predefined CSS Variable Color Tokens --- */
+:root {
+  /* Canvas Background Colors */
+  --bg-canvas-light: #f4f4f6;
+  --bg-canvas-dark: #050811;
+  --bg-pocket-dark: #000000;
+
+  /* Card Surfaces */
+  --card-bg-light: #ffffff;
+  --card-bg-dark: rgba(15, 23, 42, 0.9);
+
+  /* Primary & Brand Accents */
+  --brand-mint: #10b981;
+  --brand-mint-hover: #059669;
+  --brand-mint-accent: #34d399;
+  --brand-emerald: #10b981;
+
+  /* Typography Colors */
+  --text-headline-light: #000000;
+  --text-headline-dark: #ffffff;
+  --text-subtitle-light: #64748b;
+  --text-subtitle-dark: #94a3b8;
+
+  /* Borders & Hairlines */
+  --border-card-light: rgba(226, 232, 240, 0.8);
+  --border-card-dark: rgba(255, 255, 255, 0.1);
+}
+
+@layer base {
+  html,
+  body {
+    overflow-x: clip;
+    max-width: 100%;
+    font-family: 'Inter', 'Noto Sans Ethiopic', sans-serif;
+  }
+
+  /* Default Light Theme Canvas */
+  html,
+  body,
+  #root {
+    background-color: var(--bg-canvas-light);
+    color: var(--text-headline-light);
+  }
+
+  /* Explicit Dark Theme Canvas Override */
+  html.dark,
+  html.dark body,
+  html.dark #root {
+    background-color: var(--bg-canvas-dark);
+    color: var(--text-headline-dark);
+  }
+}
+
+@layer utilities {
+  .font-general-sans {
+    font-family: 'General Sans', 'General Sans Placeholder', sans-serif;
+    font-feature-settings: 'blwf', 'cv03', 'cv04', 'cv09', 'cv11';
+  }
+
+  /* Modern Glassmorphic Card Token */
+  .glass-card {
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border-card-light);
+  }
+
+  .dark .glass-card {
+    background: rgba(15, 23, 42, 0.8);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border-card-dark);
+  }
+
+  /* Predefined Central Pill Buttons */
+  .nova-pill-mint {
+    background-color: var(--brand-mint);
+    color: #ffffff;
+    border-radius: 9999px;
+    font-weight: 500;
+    font-family: 'General Sans', sans-serif;
+    font-size: 19px;
+    letter-spacing: -0.38px;
+    line-height: 24.7px;
+    white-space: nowrap;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: 'blwf', 'cv03', 'cv04', 'cv09', 'cv11';
+    transition: all 0.2s ease-in-out;
+  }
+
+  .nova-pill-mint:hover {
+    background-color: var(--brand-mint-hover);
+  }
+
+  /* Dynamic Dot Pattern Background */
+  .bg-dot-pattern {
+    background-image: radial-gradient(rgba(0, 0, 0, 0.08) 1px, transparent 1px);
+    background-size: 16px 16px;
+  }
+
+  .dark .bg-dot-pattern {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+    background-size: 16px 16px;
+  }
+
+  /* Infinite Marquee Animation */
+  @keyframes marquee-scroll {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-50%);
+    }
+  }
+
+  .animate-marquee-infinite {
+    display: flex;
+    width: max-content;
+    animation: marquee-scroll 32s linear infinite;
+    will-change: transform;
+  }
+
+  .animate-marquee-infinite:hover {
+    animation-play-state: paused;
+  }
+}
